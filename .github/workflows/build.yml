@@ -126,21 +126,33 @@ jobs:
           import android.Manifest
           import android.annotation.SuppressLint
           import android.content.ContentValues
+          import android.content.Context
           import android.content.pm.PackageManager
+          import android.graphics.Canvas
           import android.graphics.Color
+          import android.graphics.Paint
+          import android.hardware.camera2.CameraCharacteristics
+          import android.hardware.camera2.CaptureRequest
           import android.os.Build
           import android.os.Bundle
+          import android.os.CountDownTimer
           import android.provider.MediaStore
           import android.view.Gravity
           import android.view.MotionEvent
           import android.view.ScaleGestureDetector
+          import android.view.View
           import android.view.ViewGroup
           import android.widget.Button
           import android.widget.FrameLayout
           import android.widget.LinearLayout
+          import android.widget.SeekBar
+          import android.widget.TextView
           import android.widget.Toast
           import androidx.activity.ComponentActivity
           import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.camera.camera2.interop.Camera2CameraControl
+          import androidx.camera.camera2.interop.Camera2CameraInfo
+          import androidx.camera.camera2.interop.CaptureRequestOptions
           import androidx.camera.core.Camera
           import androidx.camera.core.CameraSelector
           import androidx.camera.core.FocusMeteringAction
@@ -160,23 +172,60 @@ jobs:
           import java.text.SimpleDateFormat
           import java.util.Locale
 
+          /** Сетка «правило третей» поверх превью. */
+          class GridView(context: Context) : View(context) {
+              private val paint = Paint().apply {
+                  color = Color.argb(170, 255, 255, 255)
+                  strokeWidth = 2f
+                  isAntiAlias = true
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  super.onDraw(canvas)
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  for (i in 1..2) {
+                      canvas.drawLine(w * i / 3f, 0f, w * i / 3f, h, paint)
+                      canvas.drawLine(0f, h * i / 3f, w, h * i / 3f, paint)
+                  }
+              }
+          }
+
           class MainActivity : ComponentActivity() {
 
               private lateinit var previewView: PreviewView
+              private lateinit var gridView: GridView
+              private lateinit var countdownText: TextView
+              private lateinit var infoText: TextView
+              private lateinit var seekA: SeekBar
+              private lateinit var seekB: SeekBar
+
               private lateinit var shutterBtn: Button
               private lateinit var modeBtn: Button
               private lateinit var flashBtn: Button
               private lateinit var flipBtn: Button
+              private lateinit var gridBtn: Button
+              private lateinit var timerBtn: Button
+              private lateinit var manualBtn: Button
 
               private var provider: ProcessCameraProvider? = null
               private var camera: Camera? = null
               private var imageCapture: ImageCapture? = null
               private var videoCapture: VideoCapture<Recorder>? = null
               private var recording: Recording? = null
+              private var countdown: CountDownTimer? = null
 
               private var lensFacing = CameraSelector.LENS_FACING_BACK
               private var flashMode = ImageCapture.FLASH_MODE_OFF
               private var videoMode = false
+
+              private var gridOn = false
+              private var timerSeconds = 0
+              private var manualMode = false
+              private var evProgress = 50
+              private var isoProgress = 30
+              private var shutterProgress = 50
+              private var updatingSeek = false
 
               private val permissionLauncher =
                   registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
@@ -200,41 +249,71 @@ jobs:
               @SuppressLint("ClickableViewAccessibility")
               private fun buildUi() {
                   val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+                  val match = ViewGroup.LayoutParams.MATCH_PARENT
+                  val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
 
                   previewView = PreviewView(this).apply {
                       scaleType = PreviewView.ScaleType.FIT_CENTER
                   }
-                  root.addView(
-                      previewView,
-                      FrameLayout.LayoutParams(
-                          ViewGroup.LayoutParams.MATCH_PARENT,
-                          ViewGroup.LayoutParams.MATCH_PARENT
-                      )
-                  )
+                  root.addView(previewView, FrameLayout.LayoutParams(match, match))
 
-                  val bar = LinearLayout(this).apply {
-                      orientation = LinearLayout.HORIZONTAL
+                  gridView = GridView(this).apply { visibility = View.GONE }
+                  root.addView(gridView, FrameLayout.LayoutParams(match, match))
+
+                  countdownText = TextView(this).apply {
+                      setTextColor(Color.WHITE)
+                      textSize = 96f
                       gravity = Gravity.CENTER
-                      setBackgroundColor(Color.parseColor("#66000000"))
-                      setPadding(dp(8), dp(16), dp(8), dp(32))
+                      visibility = View.GONE
                   }
+                  root.addView(countdownText, FrameLayout.LayoutParams(match, match))
+
+                  val panel = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.parseColor("#66000000"))
+                      setPadding(dp(8), dp(8), dp(8), dp(24))
+                  }
+
+                  infoText = TextView(this).apply {
+                      setTextColor(Color.WHITE)
+                      textSize = 13f
+                      gravity = Gravity.CENTER
+                  }
+                  seekA = SeekBar(this).apply { max = 100; progress = evProgress }
+                  seekB = SeekBar(this).apply {
+                      max = 100
+                      progress = shutterProgress
+                      visibility = View.GONE
+                  }
+
+                  seekA.setOnSeekBarChangeListener(seekListener { p ->
+                      if (manualMode) isoProgress = p else evProgress = p
+                      applyExposure()
+                  })
+                  seekB.setOnSeekBarChangeListener(seekListener { p ->
+                      shutterProgress = p
+                      applyExposure()
+                  })
+
+                  gridBtn = makeButton("Сетка: выкл") { toggleGrid() }
+                  timerBtn = makeButton("Таймер: выкл") { cycleTimer() }
+                  manualBtn = makeButton("Экспозиция: авто") { toggleManual() }
 
                   flashBtn = makeButton("Вспышка: выкл") { cycleFlash() }
                   shutterBtn = makeButton("Снимок") { onShutter() }
                   modeBtn = makeButton("Режим: фото") { toggleMode() }
                   flipBtn = makeButton("Камера ⟲") { flipCamera() }
 
-                  val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                  listOf(flashBtn, shutterBtn, modeBtn, flipBtn).forEach { bar.addView(it, lp) }
+                  val row2 = makeRow(listOf(gridBtn, timerBtn, manualBtn))
+                  val row1 = makeRow(listOf(flashBtn, shutterBtn, modeBtn, flipBtn))
 
-                  root.addView(
-                      bar,
-                      FrameLayout.LayoutParams(
-                          ViewGroup.LayoutParams.MATCH_PARENT,
-                          ViewGroup.LayoutParams.WRAP_CONTENT,
-                          Gravity.BOTTOM
-                      )
-                  )
+                  panel.addView(infoText, LinearLayout.LayoutParams(match, wrap))
+                  panel.addView(seekA, LinearLayout.LayoutParams(match, wrap))
+                  panel.addView(seekB, LinearLayout.LayoutParams(match, wrap))
+                  panel.addView(row2, LinearLayout.LayoutParams(match, wrap))
+                  panel.addView(row1, LinearLayout.LayoutParams(match, wrap))
+
+                  root.addView(panel, FrameLayout.LayoutParams(match, wrap, Gravity.BOTTOM))
                   setContentView(root)
 
                   // Зум щипком и фокус касанием
@@ -265,11 +344,37 @@ jobs:
                       }
                       true
                   }
+
+                  updateUi()
               }
+
+              private fun makeRow(buttons: List<Button>): LinearLayout {
+                  val row = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER
+                  }
+                  buttons.forEach {
+                      row.addView(
+                          it,
+                          LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                      )
+                  }
+                  return row
+              }
+
+              private fun seekListener(onChange: (Int) -> Unit) =
+                  object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(bar: SeekBar?, progress: Int, fromUser: Boolean) {
+                          if (!updatingSeek) onChange(progress)
+                      }
+
+                      override fun onStartTrackingTouch(bar: SeekBar?) {}
+                      override fun onStopTrackingTouch(bar: SeekBar?) {}
+                  }
 
               private fun makeButton(text: String, onClick: () -> Unit) = Button(this).apply {
                   this.text = text
-                  textSize = 12f
+                  textSize = 11f
                   isAllCaps = false
                   setOnClickListener { onClick() }
               }
@@ -287,178 +392,76 @@ jobs:
                   }
                   modeBtn.text = if (videoMode) "Режим: видео" else "Режим: фото"
                   shutterBtn.text = when {
+                      countdown != null -> "Отмена"
                       !videoMode -> "Снимок"
                       recording != null -> "Стоп"
                       else -> "Запись"
                   }
                   shutterBtn.setTextColor(if (recording != null) Color.RED else Color.BLACK)
-                  modeBtn.isEnabled = recording == null
-                  flipBtn.isEnabled = recording == null
+                  modeBtn.isEnabled = recording == null && countdown == null
+                  flipBtn.isEnabled = recording == null && countdown == null
+
+                  gridBtn.text = if (gridOn) "Сетка: вкл" else "Сетка: выкл"
+                  gridView.visibility = if (gridOn) View.VISIBLE else View.GONE
+                  timerBtn.text = if (timerSeconds == 0) "Таймер: выкл" else "Таймер: $timerSeconds с"
+                  manualBtn.text = if (manualMode) "Экспозиция: ручная" else "Экспозиция: авто"
+                  seekB.visibility = if (manualMode) View.VISIBLE else View.GONE
               }
 
-              // ---------- Камера ----------
+              // ---------- Сетка, таймер, экспозиция ----------
 
-              private fun startCamera() {
-                  val future = ProcessCameraProvider.getInstance(this)
-                  future.addListener({
-                      provider = future.get()
-                      bindUseCases()
-                  }, ContextCompat.getMainExecutor(this))
+              private fun toggleGrid() {
+                  gridOn = !gridOn
+                  updateUi()
               }
 
-              private fun bindUseCases() {
-                  val p = provider ?: return
-                  p.unbindAll()
-
-                  val selector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
-                  val preview = Preview.Builder().build().also {
-                      it.setSurfaceProvider(previewView.surfaceProvider)
-                  }
-
-                  try {
-                      camera = if (videoMode) {
-                          val recorder = Recorder.Builder()
-                              .setQualitySelector(QualitySelector.from(Quality.HIGHEST))
-                              .build()
-                          videoCapture = VideoCapture.withOutput(recorder)
-                          imageCapture = null
-                          p.bindToLifecycle(this, selector, preview, videoCapture)
-                      } else {
-                          imageCapture = ImageCapture.Builder()
-                              .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
-                              .setFlashMode(flashMode)
-                              .build()
-                          videoCapture = null
-                          p.bindToLifecycle(this, selector, preview, imageCapture)
-                      }
-                      if (videoMode) {
-                          camera?.cameraControl?.enableTorch(flashMode == ImageCapture.FLASH_MODE_ON)
-                      }
-                  } catch (e: Exception) {
-                      toast("Не удалось запустить камеру: ${e.message}")
+              private fun cycleTimer() {
+                  timerSeconds = when (timerSeconds) {
+                      0 -> 3
+                      3 -> 10
+                      else -> 0
                   }
                   updateUi()
               }
 
-              private fun cycleFlash() {
-                  flashMode = if (videoMode) {
-                      if (flashMode == ImageCapture.FLASH_MODE_ON) ImageCapture.FLASH_MODE_OFF
-                      else ImageCapture.FLASH_MODE_ON
-                  } else {
-                      when (flashMode) {
-                          ImageCapture.FLASH_MODE_OFF -> ImageCapture.FLASH_MODE_ON
-                          ImageCapture.FLASH_MODE_ON -> ImageCapture.FLASH_MODE_AUTO
-                          else -> ImageCapture.FLASH_MODE_OFF
-                      }
-                  }
-                  imageCapture?.flashMode = flashMode
-                  if (videoMode) camera?.cameraControl?.enableTorch(flashMode == ImageCapture.FLASH_MODE_ON)
+              private fun toggleManual() {
+                  manualMode = !manualMode
+                  setSeekProgress()
+                  applyExposure()
                   updateUi()
               }
 
-              private fun toggleMode() {
-                  videoMode = !videoMode
-                  flashMode = ImageCapture.FLASH_MODE_OFF
-                  bindUseCases()
+              private fun setSeekProgress() {
+                  updatingSeek = true
+                  seekA.progress = if (manualMode) isoProgress else evProgress
+                  seekB.progress = shutterProgress
+                  updatingSeek = false
               }
 
-              private fun flipCamera() {
-                  lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK)
-                      CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
-                  bindUseCases()
+              private fun formatShutter(ns: Long): String {
+                  val denom = Math.round(1_000_000_000.0 / ns)
+                  return if (denom <= 1L) "1 с" else "1/$denom"
               }
 
-              private fun onShutter() {
-                  if (videoMode) toggleRecording() else takePhoto()
-              }
+              private fun applyExposure() {
+                  val cam = camera ?: return
+                  val c2 = Camera2CameraControl.from(cam.cameraControl)
 
-              private fun timestamp() =
-                  SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(System.currentTimeMillis())
-
-              // ---------- Фото ----------
-
-              private fun takePhoto() {
-                  val ic = imageCapture ?: return
-                  val values = ContentValues().apply {
-                      put(MediaStore.MediaColumns.DISPLAY_NAME, "IMG_${timestamp()}")
-                      put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-                      if (Build.VERSION.SDK_INT > Build.VERSION_CODES.P) {
-                          put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/SuperCamera")
-                      }
-                  }
-                  val options = ImageCapture.OutputFileOptions.Builder(
-                      contentResolver,
-                      MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                      values
-                  ).build()
-
-                  ic.takePicture(
-                      options,
-                      ContextCompat.getMainExecutor(this),
-                      object : ImageCapture.OnImageSavedCallback {
-                          override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                              toast("Фото сохранено в галерею")
-                          }
-
-                          override fun onError(e: ImageCaptureException) {
-                              toast("Ошибка съёмки: ${e.message}")
-                          }
-                      })
-              }
-
-              // ---------- Видео ----------
-
-              @SuppressLint("MissingPermission")
-              private fun toggleRecording() {
-                  val vc = videoCapture ?: return
-
-                  val current = recording
-                  if (current != null) {
-                      current.stop()
-                      return
-                  }
-
-                  val values = ContentValues().apply {
-                      put(MediaStore.MediaColumns.DISPLAY_NAME, "VID_${timestamp()}")
-                      put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
-                      if (Build.VERSION.SDK_INT > Build.VERSION_CODES.P) {
-                          put(MediaStore.MediaColumns.RELATIVE_PATH, "Movies/SuperCamera")
-                      }
-                  }
-                  val output = MediaStoreOutputOptions.Builder(
-                      contentResolver,
-                      MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-                  ).setContentValues(values).build()
-
-                  var pending = vc.output.prepareRecording(this, output)
-                  val hasAudio = ContextCompat.checkSelfPermission(
-                      this, Manifest.permission.RECORD_AUDIO
-                  ) == PackageManager.PERMISSION_GRANTED
-                  if (hasAudio) pending = pending.withAudioEnabled()
-
-                  recording = pending.start(ContextCompat.getMainExecutor(this)) { event ->
-                      if (event is VideoRecordEvent.Finalize) {
-                          recording = null
-                          if (event.hasError()) toast("Ошибка записи видео")
-                          else toast("Видео сохранено в галерею")
+                  if (manualMode) {
+                      val info = Camera2CameraInfo.from(cam.cameraInfo)
+                      val isoRange =
+                          info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+                      val expRange =
+                          info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+                      if (isoRange == null || expRange == null) {
+                          toast("Ручной режим не поддерживается этой камерой")
+                          manualMode = false
+                          setSeekProgress()
+                          applyExposure()
                           updateUi()
+                          return
                       }
-                  }
-                  updateUi()
-              }
-
-              override fun onDestroy() {
-                  recording?.stop()
-                  super.onDestroy()
-              }
-          }
-          KOD_EOF
-
-      - name: Build debug APK
-        run: gradle assembleDebug --no-daemon
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: SuperCamera-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
-          
+                      val iso = isoRange.lower + (isoRange.upper - isoRange.lower) * isoProgress / 100
+                      val lo = maxOf(expRange.lower, 125_000L).toDouble()
+                      val hi = maxOf(minOf(expRange.upper, 250_000_000L).toDouble(), lo)
+                      val ns = (lo * Math.pow(hi / lo, shutterProgress / 100.0)).
