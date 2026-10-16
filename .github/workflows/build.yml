@@ -464,4 +464,231 @@ jobs:
                       val iso = isoRange.lower + (isoRange.upper - isoRange.lower) * isoProgress / 100
                       val lo = maxOf(expRange.lower, 125_000L).toDouble()
                       val hi = maxOf(minOf(expRange.upper, 250_000_000L).toDouble(), lo)
-                      val ns = (lo * Math.pow(hi / lo, shutterProgress / 100.0)).
+                      val ns = (lo * Math.pow(hi / lo, shutterProgress / 100.0)).toLong()
+
+                      c2.setCaptureRequestOptions(
+                          CaptureRequestOptions.Builder()
+                              .setCaptureRequestOption(
+                                  CaptureRequest.CONTROL_AE_MODE,
+                                  CaptureRequest.CONTROL_AE_MODE_OFF
+                              )
+                              .setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, iso)
+                              .setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, ns)
+                              .build()
+                      )
+                      infoText.text = "ISO $iso · выдержка ${formatShutter(ns)}"
+                  } else {
+                      c2.clearCaptureRequestOptions()
+                      val st = cam.cameraInfo.exposureState
+                      if (!st.isExposureCompensationSupported) {
+                          infoText.text = "Яркость: авто"
+                          return
+                      }
+                      val r = st.exposureCompensationRange
+                      val idx = r.lower + (r.upper - r.lower) * evProgress / 100
+                      cam.cameraControl.setExposureCompensationIndex(idx)
+                      val ev = idx * st.exposureCompensationStep.toFloat()
+                      infoText.text = "Яркость (EV): " + String.format(Locale.US, "%+.1f", ev)
+                  }
+              }
+
+              // ---------- Камера ----------
+
+              private fun startCamera() {
+                  val future = ProcessCameraProvider.getInstance(this)
+                  future.addListener({
+                      provider = future.get()
+                      bindUseCases()
+                  }, ContextCompat.getMainExecutor(this))
+              }
+
+              private fun bindUseCases() {
+                  val p = provider ?: return
+                  p.unbindAll()
+
+                  val selector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
+                  val preview = Preview.Builder().build().also {
+                      it.setSurfaceProvider(previewView.surfaceProvider)
+                  }
+
+                  try {
+                      camera = if (videoMode) {
+                          val recorder = Recorder.Builder()
+                              .setQualitySelector(QualitySelector.from(Quality.HIGHEST))
+                              .build()
+                          videoCapture = VideoCapture.withOutput(recorder)
+                          imageCapture = null
+                          p.bindToLifecycle(this, selector, preview, videoCapture)
+                      } else {
+                          imageCapture = ImageCapture.Builder()
+                              .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                              .setFlashMode(flashMode)
+                              .build()
+                          videoCapture = null
+                          p.bindToLifecycle(this, selector, preview, imageCapture)
+                      }
+                      if (videoMode) {
+                          camera?.cameraControl?.enableTorch(flashMode == ImageCapture.FLASH_MODE_ON)
+                      }
+                      applyExposure()
+                  } catch (e: Exception) {
+                      toast("Не удалось запустить камеру: ${e.message}")
+                  }
+                  updateUi()
+              }
+
+              private fun cycleFlash() {
+                  flashMode = if (videoMode) {
+                      if (flashMode == ImageCapture.FLASH_MODE_ON) ImageCapture.FLASH_MODE_OFF
+                      else ImageCapture.FLASH_MODE_ON
+                  } else {
+                      when (flashMode) {
+                          ImageCapture.FLASH_MODE_OFF -> ImageCapture.FLASH_MODE_ON
+                          ImageCapture.FLASH_MODE_ON -> ImageCapture.FLASH_MODE_AUTO
+                          else -> ImageCapture.FLASH_MODE_OFF
+                      }
+                  }
+                  imageCapture?.flashMode = flashMode
+                  if (videoMode) camera?.cameraControl?.enableTorch(flashMode == ImageCapture.FLASH_MODE_ON)
+                  updateUi()
+              }
+
+              private fun toggleMode() {
+                  videoMode = !videoMode
+                  flashMode = ImageCapture.FLASH_MODE_OFF
+                  bindUseCases()
+              }
+
+              private fun flipCamera() {
+                  lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK)
+                      CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
+                  bindUseCases()
+              }
+
+              private fun onShutter() {
+                  // Повторное нажатие во время отсчёта отменяет таймер
+                  if (countdown != null) {
+                      countdown?.cancel()
+                      countdown = null
+                      countdownText.visibility = View.GONE
+                      updateUi()
+                      return
+                  }
+                  // Остановка записи всегда сразу
+                  if (videoMode && recording != null) {
+                      toggleRecording()
+                      return
+                  }
+                  if (timerSeconds > 0) startCountdown() else doCapture()
+              }
+
+              private fun startCountdown() {
+                  countdownText.visibility = View.VISIBLE
+                  countdown = object : CountDownTimer(timerSeconds * 1000L, 1000L) {
+                      override fun onTick(ms: Long) {
+                          countdownText.text = ((ms + 999L) / 1000L).toString()
+                      }
+
+                      override fun onFinish() {
+                          countdownText.visibility = View.GONE
+                          countdown = null
+                          doCapture()
+                      }
+                  }.start()
+                  updateUi()
+              }
+
+              private fun doCapture() {
+                  if (videoMode) toggleRecording() else takePhoto()
+              }
+
+              private fun timestamp() =
+                  SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(System.currentTimeMillis())
+
+              // ---------- Фото ----------
+
+              private fun takePhoto() {
+                  val ic = imageCapture ?: return
+                  val values = ContentValues().apply {
+                      put(MediaStore.MediaColumns.DISPLAY_NAME, "IMG_${timestamp()}")
+                      put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+                      if (Build.VERSION.SDK_INT > Build.VERSION_CODES.P) {
+                          put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/SuperCamera")
+                      }
+                  }
+                  val options = ImageCapture.OutputFileOptions.Builder(
+                      contentResolver,
+                      MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                      values
+                  ).build()
+
+                  ic.takePicture(
+                      options,
+                      ContextCompat.getMainExecutor(this),
+                      object : ImageCapture.OnImageSavedCallback {
+                          override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                              toast("Фото сохранено в галерею")
+                          }
+
+                          override fun onError(e: ImageCaptureException) {
+                              toast("Ошибка съёмки: ${e.message}")
+                          }
+                      })
+              }
+
+              // ---------- Видео ----------
+
+              @SuppressLint("MissingPermission")
+              private fun toggleRecording() {
+                  val vc = videoCapture ?: return
+
+                  val current = recording
+                  if (current != null) {
+                      current.stop()
+                      return
+                  }
+
+                  val values = ContentValues().apply {
+                      put(MediaStore.MediaColumns.DISPLAY_NAME, "VID_${timestamp()}")
+                      put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
+                      if (Build.VERSION.SDK_INT > Build.VERSION_CODES.P) {
+                          put(MediaStore.MediaColumns.RELATIVE_PATH, "Movies/SuperCamera")
+                      }
+                  }
+                  val output = MediaStoreOutputOptions.Builder(
+                      contentResolver,
+                      MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                  ).setContentValues(values).build()
+
+                  var pending = vc.output.prepareRecording(this, output)
+                  val hasAudio = ContextCompat.checkSelfPermission(
+                      this, Manifest.permission.RECORD_AUDIO
+                  ) == PackageManager.PERMISSION_GRANTED
+                  if (hasAudio) pending = pending.withAudioEnabled()
+
+                  recording = pending.start(ContextCompat.getMainExecutor(this)) { event ->
+                      if (event is VideoRecordEvent.Finalize) {
+                          recording = null
+                          if (event.hasError()) toast("Ошибка записи видео")
+                          else toast("Видео сохранено в галерею")
+                          updateUi()
+                      }
+                  }
+                  updateUi()
+              }
+
+              override fun onDestroy() {
+                  countdown?.cancel()
+                  recording?.stop()
+                  super.onDestroy()
+              }
+          }
+          KOD_EOF
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SuperCamera-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
